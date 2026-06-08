@@ -48,6 +48,14 @@ def run_worker(master_host, master_port, worker_uuid):
                     logger.info('heartbeat response: %s', resp)
                 except Exception:
                     logger.exception('bad heartbeat response')
+
+            # also send load report every heartbeat
+            load_msg = {"type": "load_report", "payload": {"worker_uuid": worker_uuid, "load": 0}}
+            try:
+                send_line(master_host, master_port, dumps(load_msg), timeout=2)
+            except Exception:
+                logger.exception('failed to send load report')
+
             time.sleep(10)
     except KeyboardInterrupt:
         logger.info('worker stopping')
