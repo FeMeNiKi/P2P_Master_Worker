@@ -15,6 +15,7 @@ TASK_QUEUE = queue.Queue()
 WORKERS = {}
 MASTER_ID = 'master'
 PEERS = []  # list of (host,port)
+MASTER_ADDR = None
 
 def handle_conn(conn, addr):
     try:
@@ -51,6 +52,22 @@ def handle_conn(conn, addr):
                                 resp = {"type": "response_rejected", "request_id": msg.get('request_id'), "payload": {"reason": "no_workers_available"}}
                             conn.sendall(dumps(resp).encode('utf-8'))
                             continue
+                        if mtype == 'instruct_redirect':
+                            payload = msg.get('payload', {})
+                            wid = payload.get('worker_id')
+                            new_addr = payload.get('new_master_address')
+                            # find worker and send command_redirect over its conn
+                            if wid in WORKERS and WORKERS[wid].get('conn'):
+                                try:
+                                    worker_conn = WORKERS[wid]['conn']
+                                    cmd = {"type": "command_redirect", "request_id": str(uuid.uuid4()), "payload": {"new_master_address": new_addr}}
+                                    worker_conn.sendall(dumps(cmd).encode('utf-8'))
+                                    logger.info('sent command_redirect to worker %s', wid)
+                                except Exception:
+                                    logger.exception('failed to send command_redirect to worker %s', wid)
+                            else:
+                                logger.info('worker %s not found to redirect', wid)
+                            continue
 
                     # heartbeat from worker
                     if msg.get('task') == 'heartbeat':
@@ -61,7 +78,7 @@ def handle_conn(conn, addr):
                     # worker presentation
                     if msg.get('worker') == 'alive':
                         worker_uuid = msg.get('worker_uuid')
-                        WORKERS[worker_uuid] = {'addr': addr, 'last_seen': time.time(), 'status': 'idle'}
+                        WORKERS[worker_uuid] = {'addr': addr, 'last_seen': time.time(), 'status': 'idle', 'conn': conn, 'original_master': None}
                         # try to assign a task
                         try:
                             task = TASK_QUEUE.get_nowait()
@@ -92,6 +109,51 @@ def handle_conn(conn, addr):
                             WORKERS[wid]['last_seen'] = time.time()
                         continue
 
+                    # register temporary worker on this master
+                    if msg.get('type') == 'register_temporary_worker':
+                        payload = msg.get('payload', {})
+                        wid = payload.get('worker_id')
+                        orig = payload.get('original_master_address')
+                        # treat as a presented worker that is borrowed
+                        WORKERS[wid] = {'addr': addr, 'last_seen': time.time(), 'status': 'idle', 'conn': conn, 'original_master': orig}
+                        logger.info('registered temporary worker %s from %s', wid, orig)
+                        # schedule release after short demo interval
+                        def release_after_delay(wid_local, orig_addr, delay=5):
+                            time.sleep(delay)
+                            # send command_release to this worker
+                            if wid_local in WORKERS and WORKERS[wid_local].get('conn'):
+                                try:
+                                    cmd = {"type": "command_release", "request_id": str(uuid.uuid4()), "payload": {"original_master_address": orig_addr}}
+                                    WORKERS[wid_local]['conn'].sendall(dumps(cmd).encode('utf-8'))
+                                    logger.info('sent command_release to %s', wid_local)
+                                except Exception:
+                                    logger.exception('failed to send command_release')
+                            # notify original master
+                            try:
+                                oh, op = orig_addr.split(':')
+                                notify = {"type": "notify_worker_returned", "request_id": str(uuid.uuid4()), "payload": {"worker_id": wid_local}}
+                                send_line(oh, int(op), dumps(notify), timeout=2)
+                                logger.info('notified original master %s that %s returned', orig_addr, wid_local)
+                            except Exception:
+                                logger.exception('failed to notify original master')
+                            # cleanup
+                            if wid_local in WORKERS:
+                                del WORKERS[wid_local]
+
+                        t = threading.Thread(target=release_after_delay, args=(wid, orig), daemon=True)
+                        t.start()
+                        continue
+
+                    # command_release handled when sent to worker; master receives notify only from peers
+                    if msg.get('type') == 'notify_worker_returned':
+                        payload = msg.get('payload', {})
+                        wid = payload.get('worker_id')
+                        logger.info('peer notified that worker returned: %s', wid)
+                        # remove from borrowed list if present
+                        if wid in WORKERS and WORKERS[wid].get('original_master'):
+                            del WORKERS[wid]
+                        continue
+
                     logger.info('unhandled message: %s', msg)
     except Exception:
         logger.exception('connection handler failed')
@@ -106,6 +168,8 @@ def main():
     p.add_argument('--peers', default='')
     args = p.parse_args()
     MASTER_ID = args.master_id
+    global MASTER_ADDR
+    MASTER_ADDR = f"{args.host}:{args.port}"
     logging.basicConfig(level=logging.INFO)
     logger.info('starting master %s on %s:%d', MASTER_ID, args.host, args.port)
     # parse peers list host:port,comma
@@ -158,7 +222,15 @@ def balancer_loop():
                     resp = request_help(h, p, workers_needed=needed)
                     if resp and resp.get('type') == 'response_accepted':
                         logger.info('peer %s:%s accepted help: %s', h, p, resp.get('payload'))
-                        # for demo we won't actually redirect workers here
+                        # instruct peer to redirect specific workers to this master
+                        payload = resp.get('payload', {})
+                        for w in payload.get('worker_details', []):
+                            wid = w.get('id')
+                            instruct = {"type": "instruct_redirect", "request_id": str(uuid.uuid4()), "payload": {"worker_id": wid, "new_master_address": MASTER_ADDR}}
+                            try:
+                                send_line(h, p, dumps(instruct), timeout=2)
+                            except Exception:
+                                logger.exception('failed to send instruct_redirect to peer')
                         break
             time.sleep(2)
         except Exception:
