@@ -16,7 +16,7 @@ Escopo: Sprints 1 (Heartbeat), 2 (Ciclo de Tarefas) e 3 (Negociação Master-to-
 - Fornecer protocolo de negociação Master↔Master com `request_help` / `response_*` / `command_redirect` / `command_release`.
 - Garantir interoperabilidade entre implementações distintas respeitando o esquema JSON e o framing.
 
-**DoD (síntese)**: worker apresenta-se e faz heartbeat; master entrega tarefa ou responde `NO_TASK`; status retornado e ACK recebido; master saturado solicita ajuda com `request_help`, recebe `response_accepted` e workers são redirecionados e devolvidos corretamente.
+**DoD (síntese)**: worker apresenta-se e faz heartbeat; master entrega tarefa ou responde `no_task`; status retornado e `ack` recebido; master saturado solicita ajuda com `request_help`, recebe `response_accepted` e workers são redirecionados e devolvidos corretamente.
 
 ---
 
@@ -40,7 +40,7 @@ Escopo: Sprints 1 (Heartbeat), 2 (Ciclo de Tarefas) e 3 (Negociação Master-to-
 
 - `ConnectionHandler`:
   - Lê linhas (`\n` delimited), valida JSON, executa handlers por `type` (Master↔Master) ou por payload (Worker↔Master).
-  - Responsabilidades: handshake Worker (`WORKER: ALIVE`), entregar `TASK`/`NO_TASK`, processar `STATUS` e enviar `ACK`.
+  - Responsabilidades: handshake Worker (`worker: alive`), entregar `task`/`no_task`, processar `status` e enviar `ack`.
 
 - `TaskDispatcher`:
   - Puxa itens de `task_queue` e atribui a Workers disponíveis.
@@ -55,7 +55,7 @@ Escopo: Sprints 1 (Heartbeat), 2 (Ciclo de Tarefas) e 3 (Negociação Master-to-
   - Envia `request_help` com `request_id` UUID; aguarda `response_*` (timeout configurável).
 
 - `WorkerClient`:
-  - Loop de conexão: apresentar-se com `WORKER: ALIVE`, aguardar `TASK` ou `NO_TASK`, executar (simulação) e enviar `STATUS`.
+  - Loop de conexão: apresentar-se com `worker: alive`, aguardar `task` ou `no_task`, executar (simulação) e enviar `status`.
   - Suporta mensagens `command_redirect` (abrir nova conexão com novo master) e `command_release` (encerrar e retornar ao original).
 
 ---
@@ -63,15 +63,15 @@ Escopo: Sprints 1 (Heartbeat), 2 (Ciclo de Tarefas) e 3 (Negociação Master-to-
 ## 3. Fluxos de dados principais
 
 1) Heartbeat (Sprint 1)
-  - Worker → Master: `{ "SERVER_UUID": "Master_A", "TASK": "HEARTBEAT" }\n`
-  - Master → Worker: `{ "SERVER_UUID": "Master_A", "TASK": "HEARTBEAT", "RESPONSE": "ALIVE" }\n`
+  - Worker → Master: `{ "server_uuid": "master_a", "task": "heartbeat" }\n`
+  - Master → Worker: `{ "server_uuid": "master_a", "task": "heartbeat", "response": "alive" }\n`
   - Implementar loop do Worker com intervalo configurável (ex: 10s) e timeout de resposta 5s.
 
 2) Ciclo de Tarefas (Sprint 2)
-  - Apresentação: Worker → Master: `{ "WORKER": "ALIVE", "WORKER_UUID": "W-123", "SERVER_UUID": "Master_B"? }\n`
-  - Master entrega: `TASK`/`NO_TASK` per schema.
-  - Worker processa (simulação) e responde `{ "STATUS": "OK|NOK", "TASK": "QUERY", "WORKER_UUID": "..." }\n`
-  - Master responde `{ "STATUS": "ACK", "WORKER_UUID": "..." }\n`
+  - Apresentação: Worker → Master: `{ "worker": "alive", "worker_uuid": "w-123", "server_uuid": "master_b"? }\n`
+  - Master entrega: `task`/`no_task` per schema.
+  - Worker processa (simulação) e responde `{ "status": "ok|nok", "task": "query", "worker_uuid": "..." }\n`
+  - Master responde `{ "status": "ack", "worker_uuid": "..." }\n`
 
 3) Negociação Master↔Master e redirecionamento (Sprint 3)
   - `request_help` inclui `request_id`, `master_id`, `current_load`, `capacity`, `workers_needed`.
@@ -85,7 +85,7 @@ Escopo: Sprints 1 (Heartbeat), 2 (Ciclo de Tarefas) e 3 (Negociação Master-to-
 ## 4. Mensagens, framing e validação
 
 - Todas as mensagens Master↔Master seguem `{ "type": string, "request_id": uuid, "payload": { ... } }\n`.
-- Worker↔Master usam os payloads apresentados em `document.md` (WORKER/ALIVE, TASK/NO_TASK, STATUS, ACK).
+-- Worker↔Master usam os payloads apresentados em `document.md` (worker/alive, task/no_task, status, ack).
 - Framing: `\n` terminator. Handlers acumulam bytes até `\n` e chamam `json.loads`.
 - Validação: campos obrigatórios causam falha rápida (log + close) — implementar validação limpa e mensagens de erro no log para interoperabilidade.
 
@@ -143,9 +143,9 @@ python -m worker --config config_worker_1.yaml
 
 ## 8. Critérios de aceitação (DoD detalhado)
 
-1. Worker abre conexão TCP com Master e apresenta-se com `WORKER: ALIVE`.
-2. Master parseia e responde `TASK` ou `NO_TASK` corretamente.
-3. Worker executa tarefa simulada e envia `STATUS`; Master responde `ACK`.
+1. Worker abre conexão TCP com Master e apresenta-se com `worker: alive`.
+2. Master parseia e responde `task` ou `no_task` corretamente.
+3. Worker executa tarefa simulada e envia `status`; Master responde `ack`.
 4. Saturação no Master aciona `request_help` e completa negociação com `response_accepted`/`command_redirect`.
 5. Worker ofertado se registra no Master receptor e é liberado posteriormente com `command_release` e `notify_worker_returned`.
 
