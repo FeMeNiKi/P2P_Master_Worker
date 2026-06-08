@@ -1,29 +1,57 @@
 """Minimal Worker client for demo purposes."""
 import argparse
 import logging
-import socket
-from .protocol import make_presentation, loads
+import time
+from .protocol import make_presentation, loads, dumps
+from .net import send_line
 
 logger = logging.getLogger('worker')
 
+
 def run_worker(master_host, master_port, worker_uuid):
+    # present to master
     line = make_presentation(worker_uuid)
+    resp_raw = send_line(master_host, master_port, line)
+    if not resp_raw:
+        logger.info('no response to presentation')
+        return
     try:
-        with socket.create_connection((master_host, master_port), timeout=5) as sock:
-            sock.sendall(line.encode('utf-8'))
-            try:
-                sock.settimeout(5)
-                data = sock.recv(4096)
-                if data:
-                    try:
-                        msg = loads(data.decode('utf-8'))
-                        logger.info('recv: %s', msg)
-                    except Exception:
-                        logger.exception('failed parse')
-            except socket.timeout:
-                logger.info('no response from master')
+        resp = loads(resp_raw.strip())
     except Exception:
-        logger.exception('worker failed to connect')
+        logger.exception('failed parse response')
+        return
+
+    # if assigned a task, process it and report status
+    if resp.get('task') and resp.get('task') != 'no_task':
+        logger.info('received task: %s', resp)
+        # simulate processing
+        time.sleep(1)
+        status = {"status": "ok", "task": resp.get('task'), "worker_uuid": worker_uuid}
+        ack_raw = send_line(master_host, master_port, dumps(status))
+        if ack_raw:
+            try:
+                ack = loads(ack_raw.strip())
+                logger.info('received ack: %s', ack)
+            except Exception:
+                logger.exception('failed parse ack')
+    else:
+        logger.info('no task assigned')
+
+    # simple heartbeat loop (separate connections per heartbeat)
+    try:
+        while True:
+            hb = {"server_uuid": "unknown", "task": "heartbeat"}
+            resp_raw = send_line(master_host, master_port, dumps(hb), timeout=5)
+            if resp_raw:
+                try:
+                    resp = loads(resp_raw.strip())
+                    logger.info('heartbeat response: %s', resp)
+                except Exception:
+                    logger.exception('bad heartbeat response')
+            time.sleep(10)
+    except KeyboardInterrupt:
+        logger.info('worker stopping')
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -33,6 +61,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
     host, port = args.master.split(':')
     run_worker(host, int(port), args.worker_uuid)
+
 
 if __name__ == '__main__':
     main()
