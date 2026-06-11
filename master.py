@@ -34,6 +34,15 @@ TASK_COUNT           = int(os.getenv('TASK_COUNT', '0'))
 SATURATION_THRESHOLD = int(os.getenv('CAPACITY', '10'))
 RELEASE_THRESHOLD    = int(os.getenv('RELEASE_THRESHOLD', '4'))
 
+# ── Timeouts (spec: worker aguarda resposta por no máximo 5s) ─────────────────
+# Conexões M2M (negociação entre masters): 5s conforme spec Sprint 3 item 7.4
+M2M_TIMEOUT       = 5
+# Sessão persistente worker↔master: usa recv loop com timeout menor para
+# não bloquear indefinidamente; o worker já tem seu próprio timeout de 5s
+# na conexão (settimeout no conectar()), então aqui usamos 30s como limite
+# seguro para sessões estabelecidas sem atividade.
+SESSION_TIMEOUT   = 30
+
 # ── Locks ────────────────────────────────────────────────────────────────────
 fila_lock  = Lock()
 state_lock = Lock()
@@ -47,17 +56,14 @@ tasks_completed: int = 0
 tasks_failed:    int = 0
 
 # ── Registro de workers ──────────────────────────────────────────────────────
-# workers_conectados     : worker_id -> {'busy': bool, 'conn': socket, 'addr': tuple}
-# workers_emprestados    : workers recebidos de outro master — worker_id -> origem_addr
-# meus_workers_emprestados: workers nossos enviados para outro master — worker_id -> destino_addr
-workers_conectados:         dict  = {}
-workers_emprestados:        dict  = {}
-meus_workers_emprestados:   dict  = {}
-workers_para_liberar:       set   = set()
-redirecionamentos_pendentes: int  = 0
-fila_destinos_redirect:     deque = deque()
-ultimo_request_help:        float = 0.0   # timestamp da última tentativa
-REQUEST_HELP_COOLDOWN:      int   = 15    # segundos entre tentativas quando todos recusam
+workers_conectados:          dict  = {}
+workers_emprestados:         dict  = {}
+meus_workers_emprestados:    dict  = {}
+workers_para_liberar:        set   = set()
+redirecionamentos_pendentes: int   = 0
+fila_destinos_redirect:      deque = deque()
+ultimo_request_help:         float = 0.0
+REQUEST_HELP_COOLDOWN:       int   = 15
 
 
 # ── Log ──────────────────────────────────────────────────────────────────────
@@ -65,14 +71,14 @@ REQUEST_HELP_COOLDOWN:      int   = 15    # segundos entre tentativas quando tod
 def log(msg: str):
     ts = time.strftime("%H:%M:%S")
     with log_lock:
-        print(f"[{ts}] {msg}")
+        print(f"[{ts}] {msg}", flush=True)
 
 
 def log_estado_workers():
     """Sprint 3 Tarefa 07 — exibe contagem de workers a cada mudança de estado."""
     with state_lock:
-        total    = len(workers_conectados)
-        locais   = total - len(workers_emprestados)
+        total     = len(workers_conectados)
+        locais    = total - len(workers_emprestados)
         recebidos = len(workers_emprestados)
         enviados  = len(meus_workers_emprestados)
         ocupados  = sum(1 for w in workers_conectados.values() if w.get('busy'))
@@ -91,6 +97,11 @@ def enviar_linha(conn: socket.socket, payload: dict):
 
 
 def ler_linha(conn: socket.socket, buffer_state: list) -> dict:
+    """
+    Lê do socket acumulando bytes no buffer até encontrar \\n.
+    Respeita o timeout configurado no socket (SESSION_TIMEOUT para sessões
+    persistentes, M2M_TIMEOUT para negociações entre masters).
+    """
     buffer = buffer_state[0]
     while True:
         if "\n" in buffer:
@@ -136,24 +147,25 @@ def monitorar_carga():
 
         with state_lock:
             pending_redirects = redirecionamentos_pendentes
-            # has_borrowed: apenas workers emprestados que ainda têm sessão ativa
             has_borrowed = any(
                 wid in workers_conectados
                 for wid in workers_emprestados
             )
 
-        # SATURAÇÃO: pedir ajuda
-        # Tenta novamente após cooldown mesmo que vizinhos tenham recusado antes,
-        # garantindo que o sistema não para de tentar para sempre (CT07).
         agora = time.time()
         with state_lock:
             tempo_desde_ultima = agora - ultimo_request_help
-        pode_tentar = pending_redirects == 0 and not has_borrowed and tempo_desde_ultima >= REQUEST_HELP_COOLDOWN
+
+        pode_tentar = (
+            pending_redirects == 0
+            and not has_borrowed
+            and tempo_desde_ultima >= REQUEST_HELP_COOLDOWN
+        )
+
         if carga_atual >= SATURATION_THRESHOLD and pode_tentar:
             log(f"[CARGA] Saturação detectada ({carga_atual} tarefas). Enviando request_help...")
             _solicitar_ajuda(carga_atual)
 
-        # NORMALIZAÇÃO: marcar workers recebidos para devolução
         if carga_atual <= RELEASE_THRESHOLD and has_borrowed:
             log(f"[CARGA] Fila normalizada ({carga_atual} tarefas). Marcando workers para devolução...")
             with state_lock:
@@ -168,11 +180,10 @@ def _solicitar_ajuda(carga_atual: int):
     """
     Percorre NEIGHBORS tentando obter workers emprestados.
     CT03: request_id único por chamada.
-    CT07: timeout de 5s por vizinho — descarta e tenta próximo.
+    CT07: timeout de 5s por vizinho (M2M_TIMEOUT) — descarta e tenta próximo.
     """
     global redirecionamentos_pendentes, ultimo_request_help
 
-    # Registra timestamp antes de tentar — evita spam de requests simultâneos
     with state_lock:
         ultimo_request_help = time.time()
 
@@ -202,7 +213,8 @@ def _solicitar_ajuda(carga_atual: int):
             peer_port = int(peer_port_str)
 
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
+            # CT07: timeout de exatamente 5s conforme spec Sprint 3 item 7.4
+            s.settimeout(M2M_TIMEOUT)
             s.connect((peer_host, peer_port))
             enviar_linha(s, msg)
             log(f"[M2M] request_help enviado → {peer} (request_id={req_id})")
@@ -227,7 +239,7 @@ def _solicitar_ajuda(carga_atual: int):
                     redirecionamentos_pendentes += offered
                     for _ in range(offered):
                         fila_destinos_redirect.append(meu_addr)
-                return  # sucesso — para de tentar outros vizinhos
+                return
 
             elif res_type == "response_rejected":
                 p      = res.get("payload") or res.get("PAYLOAD") or {}
@@ -239,8 +251,9 @@ def _solicitar_ajuda(carga_atual: int):
                 log(f"[M2M] Tipo de resposta desconhecido de {peer}: '{res_type}'. Ignorado.")
 
         except socket.timeout:
-            # CT07: timeout — descarta request_id e tenta próximo
-            log(f"[M2M TIMEOUT] {peer} não respondeu em 5s. request_id={req_id} descartado. Tentando próximo...")
+            # CT07: timeout de 5s — descarta request_id e tenta próximo vizinho
+            log(f"[M2M TIMEOUT] {peer} não respondeu em {M2M_TIMEOUT}s. "
+                f"request_id={req_id} descartado. Tentando próximo...")
         except Exception as e:
             log(f"[M2M ERRO] Falha ao contactar {peer}: {e}")
 
@@ -264,7 +277,7 @@ def _enviar_notify_worker_returned(worker_id: str, origem_addr: str):
     }
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3)
+        s.settimeout(M2M_TIMEOUT)
         s.connect((ip, port))
         enviar_linha(s, msg)
         s.close()
@@ -280,6 +293,8 @@ def tratar_cliente(conn: socket.socket, addr):
     Trata uma conexão persistente. Pode vir de:
       - Worker próprio ou emprestado  (campo WORKER ou TASK=HEARTBEAT)
       - Master vizinho                (campo 'type', protocolo M2M Sprint 3)
+
+    Timeout de sessão: SESSION_TIMEOUT (30s) para detectar workers inativos.
     Aceita chaves em MAIÚSCULO ou minúsculo para interoperabilidade (O6).
     """
     global redirecionamentos_pendentes, tasks_completed, tasks_failed
@@ -288,12 +303,19 @@ def tratar_cliente(conn: socket.socket, addr):
     buffer_state       = [""]
 
     try:
-        conn.settimeout(60)
+        # Timeout de sessão: detecta inatividade em conexões estabelecidas.
+        # Diferente do timeout de 5s do worker (que é no connect()), este
+        # controla quanto tempo o master aguarda nova mensagem do worker.
+        conn.settimeout(SESSION_TIMEOUT)
 
         while True:
             try:
                 payload = ler_linha(conn, buffer_state)
-            except (ConnectionError, socket.timeout):
+            except socket.timeout:
+                # Worker ficou silencioso por SESSION_TIMEOUT — encerra sessão limpa
+                log(f"[SESSÃO TIMEOUT] Worker '{worker_uuid_sessao}' inativo por {SESSION_TIMEOUT}s. Encerrando.")
+                break
+            except (ConnectionError, OSError):
                 break
             except json.JSONDecodeError:
                 log(f"[PARSE ERRO] JSON inválido de {addr}. Ignorando.")
@@ -323,8 +345,6 @@ def tratar_cliente(conn: socket.socket, addr):
                             for _ in range(workers_pedidos):
                                 fila_destinos_redirect.append(solicitante_addr)
 
-                            # worker_details: lista os workers locais ociosos disponíveis
-                            # (workers que ainda não foram enviados para nenhum master)
                             ociosos = [
                                 wid for wid, info in workers_conectados.items()
                                 if not info.get('busy')
@@ -355,7 +375,8 @@ def tratar_cliente(conn: socket.socket, addr):
                         log(f"[M2M] request_help RECUSADO (carga={minha_carga}). (request_id={req_id})")
 
                     enviar_linha(conn, resposta)
-                    continue
+                    # Conexão M2M é de curta duração (request/response) — encerra após responder
+                    break
 
                 # ── notify_worker_returned ───────────────────────────────────
                 if msg_type == "notify_worker_returned":
@@ -366,7 +387,7 @@ def tratar_cliente(conn: socket.socket, addr):
                         meus_workers_emprestados.pop(w_id, None)
                     log(f"[M2M] notify_worker_returned. Worker '{w_id}' devolvido. (request_id={req_id})")
                     log_estado_workers()
-                    continue
+                    break
 
                 # ── register_temporary_worker ────────────────────────────────
                 if msg_type == "register_temporary_worker":
@@ -391,7 +412,6 @@ def tratar_cliente(conn: socket.socket, addr):
 
                     enviar_linha(conn, {"STATUS": "ACK", "WORKER_UUID": w_id})
                     log(f"[P2P] Worker emprestado '{w_id}' registrado. Origem: {origem_addr} (request_id={req_id})")
-                    # Sprint 3 Tarefa 07: log de ciclo de vida — empréstimo registrado
                     log(f"[CICLO-VIDA] Worker '{w_id}': emprestado de {origem_addr} → agora ativo aqui.")
                     log_estado_workers()
                     continue
@@ -414,7 +434,8 @@ def tratar_cliente(conn: socket.socket, addr):
                     "RESPONSE":    "ALIVE"
                 })
                 log(f"[HEARTBEAT] Respondido para Worker '{worker_uuid_hb}'.")
-                continue
+                # Heartbeat usa conexão de curta duração (connect → send → recv → close)
+                break
 
             # Sprint 2: WORKER ALIVE — apresentação / pedido de tarefa
             worker_raw = payload.get("WORKER") or payload.get("worker") or ""
@@ -423,7 +444,6 @@ def tratar_cliente(conn: socket.socket, addr):
                 server_uuid_orig = payload.get("SERVER_UUID") or payload.get("server_uuid")
                 worker_uuid_sessao = worker_uuid
 
-                # Registrar/atualizar worker na lista de conectados
                 with state_lock:
                     if worker_uuid not in workers_conectados:
                         workers_conectados[worker_uuid] = {'busy': False, 'conn': conn, 'addr': addr}
@@ -456,10 +476,9 @@ def tratar_cliente(conn: socket.socket, addr):
                     with state_lock:
                         meus_workers_emprestados[worker_uuid] = destino_redirect
                     log(f"[P2P] command_redirect → Worker '{worker_uuid}' para {destino_redirect} (request_id={req_id})")
-                    # Sprint 3 Tarefa 07: ciclo de vida — envio registrado
                     log(f"[CICLO-VIDA] Worker '{worker_uuid}': enviado para {destino_redirect}.")
                     log_estado_workers()
-                    break  # sessão encerra; worker abre nova conexão com o outro master
+                    break
 
                 # Sprint 3: verificar se worker emprestado deve ser devolvido
                 release_now = False
@@ -479,7 +498,6 @@ def tratar_cliente(conn: socket.socket, addr):
                         "payload":    {"original_master_address": server_uuid_orig}
                     })
                     log(f"[DEVOLUÇÃO] command_release → Worker '{worker_uuid}' volta para {server_uuid_orig} (request_id={req_id})")
-                    # Sprint 3 Tarefa 07: ciclo de vida — devolução registrada
                     log(f"[CICLO-VIDA] Worker '{worker_uuid}': devolvido para {server_uuid_orig}.")
                     log_estado_workers()
                     threading.Thread(
@@ -487,14 +505,13 @@ def tratar_cliente(conn: socket.socket, addr):
                         args=(worker_uuid, server_uuid_orig),
                         daemon=True
                     ).start()
-                    break  # sessão encerra; worker reconecta no master original
+                    break
 
                 # Sprint 2: distribuir tarefa ou informar fila vazia
                 with fila_lock:
                     tarefa = fila_tarefas.popleft() if fila_tarefas else None
 
                 if tarefa:
-                    # Marcar worker como ocupado
                     with state_lock:
                         if worker_uuid in workers_conectados:
                             workers_conectados[worker_uuid]['busy'] = True
@@ -507,7 +524,6 @@ def tratar_cliente(conn: socket.socket, addr):
                         if status_val not in ("OK", "NOK"):
                             log(f"[AVISO] STATUS inválido '{status_val}' de '{worker_uuid}'. Aceito mesmo assim.")
 
-                        # Sprint 3 Tarefa 07: log de tarefa concluída por worker local ou emprestado
                         with state_lock:
                             if status_val == "OK":
                                 tasks_completed += 1
@@ -524,7 +540,7 @@ def tratar_cliente(conn: socket.socket, addr):
                     except Exception as e:
                         log(f"[ERRO SESSÃO] Falha ao processar tarefa do worker '{worker_uuid}': {e}")
                         with fila_lock:
-                            fila_tarefas.appendleft(tarefa)  # recoloca na frente da fila
+                            fila_tarefas.appendleft(tarefa)
                         with state_lock:
                             if worker_uuid in workers_conectados:
                                 workers_conectados[worker_uuid]['busy'] = False
@@ -532,20 +548,18 @@ def tratar_cliente(conn: socket.socket, addr):
                 else:
                     enviar_linha(conn, {"TASK": "NO_TASK"})
 
-                continue
+                # Sessão de tarefa é de curta duração (apresentação → tarefa → status → ack)
+                # Worker fecha e reabre conexão a cada ciclo
+                break
 
             log(f"[PROTOCOLO] Mensagem não reconhecida de {addr}: {payload}. Ignorada.")
 
     except Exception as e:
         log(f"[CONEXÃO FECHADA] Sessão encerrada ({addr}): {e}")
     finally:
-        # Limpar todos os registros do worker ao fechar sessão.
-        # Cobre quedas abruptas de conexão sem command_release/redirect.
         if worker_uuid_sessao:
             with state_lock:
                 workers_conectados.pop(worker_uuid_sessao, None)
-                # Se era worker emprestado e caiu sem ser devolvido, limpa o registro
-                # para não deixar has_borrowed=True eternamente
                 workers_emprestados.pop(worker_uuid_sessao, None)
                 workers_para_liberar.discard(worker_uuid_sessao)
         conn.close()
@@ -565,6 +579,8 @@ def iniciar_master():
     log(f"=== MASTER '{SERVER_UUID}' ON-LINE EM {HOST}:{PORT} ===")
     log(f"    Saturation threshold : {SATURATION_THRESHOLD} tarefas")
     log(f"    Release threshold    : {RELEASE_THRESHOLD} tarefas")
+    log(f"    Session timeout      : {SESSION_TIMEOUT}s")
+    log(f"    M2M timeout          : {M2M_TIMEOUT}s")
     log(f"    Vizinhos configurados: {NEIGHBORS or 'nenhum'}")
 
     while True:
@@ -579,4 +595,4 @@ def iniciar_master():
 
 
 if __name__ == '__main__':
-    iniciar_master() 
+    iniciar_master()
